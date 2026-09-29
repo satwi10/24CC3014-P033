@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  24CC3014-P033: AWS Lambda with Provisioned Concurrency for 100ms p99 Payment Latency SLA
+
+Resources:
+  PaymentAuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: PaymentAuthFunction
+      CodeUri: ../src/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      MemorySize: 1024
+      Timeout: 5
+      AutoPublishAlias: prod
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: 5
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PaymentTransactionsTable
+      Events:
+        AuthorizeApi:
+          Type: HttpApi
+          Properties:
+            Path: /authorize
+            Method: post
+
+  # Bottleneck 2 Mitigation: Auto-Scale Provisioned Concurrency before spillover cold starts occur
+  ProvisionedConcurrencyScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 20
+      MinCapacity: 2
+      ResourceId: !Sub function:${PaymentAuthFunction}:prod
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/lambda.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_LambdaConcurrency
+      ScalableDimension: lambda:function:ProvisionedConcurrency
+      ServiceNamespace: lambda
+
+  ProvisionedConcurrencyScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: PaymentLatencyTargetTracking
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ProvisionedConcurrencyScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 0.70 # Scales out at 70% utilization to prevent spillover cold starts
+        PredefinedMetricSpecification:
+          PredefinedMetricType: LambdaProvisionedConcurrencyUtilization
+
+  PaymentTransactionsTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: PaymentTransactions
+      PrimaryKey:
+        Name: transaction_id
+        Type: String
